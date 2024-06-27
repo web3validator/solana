@@ -6,7 +6,7 @@ extern crate proc_macro;
 
 use {
     proc_macro::TokenStream,
-    proc_macro2::{Delimiter, Span, TokenTree},
+    proc_macro2::Span,
     quote::{quote, ToTokens},
     syn::{
         bracketed,
@@ -14,7 +14,7 @@ use {
         parse_macro_input,
         punctuated::Punctuated,
         token::Bracket,
-        Expr, Ident, LitByte, LitStr, Path, Token,
+        Expr, Ident, LitByte, LitStr, Token,
     },
 };
 
@@ -180,75 +180,6 @@ impl ToTokens for ProgramSdkIdDeprecated {
     }
 }
 
-struct RespanInput {
-    to_respan: Path,
-    respan_using: Span,
-}
-
-impl Parse for RespanInput {
-    fn parse(input: ParseStream) -> Result<Self> {
-        let to_respan: Path = input.parse()?;
-        let _comma: Token![,] = input.parse()?;
-        let respan_tree: TokenTree = input.parse()?;
-        match respan_tree {
-            TokenTree::Group(g) if g.delimiter() == Delimiter::None => {
-                let ident: Ident = syn::parse2(g.stream())?;
-                Ok(RespanInput {
-                    to_respan,
-                    respan_using: ident.span(),
-                })
-            }
-            TokenTree::Ident(i) => Ok(RespanInput {
-                to_respan,
-                respan_using: i.span(),
-            }),
-            val => Err(syn::Error::new_spanned(
-                val,
-                "expected None-delimited group",
-            )),
-        }
-    }
-}
-
-/// A proc-macro which respans the tokens in its first argument (a `Path`)
-/// to be resolved at the tokens of its second argument.
-/// For internal use only.
-///
-/// There must be exactly one comma in the input,
-/// which is used to separate the two arguments.
-/// The second argument should be exactly one token.
-///
-/// For example, `respan!($crate::foo, with_span)`
-/// produces the tokens `$crate::foo`, but resolved
-/// at the span of `with_span`.
-///
-/// The input to this function should be very short -
-/// its only purpose is to override the span of a token
-/// sequence containing `$crate`. For all other purposes,
-/// a more general proc-macro should be used.
-#[rustversion::since(1.46.0)] // `Span::resolved_at` is stable in 1.46.0 and above
-#[proc_macro]
-pub fn respan(input: TokenStream) -> TokenStream {
-    // Obtain the `Path` we are going to respan, and the ident
-    // whose span we will be using.
-    let RespanInput {
-        to_respan,
-        respan_using,
-    } = parse_macro_input!(input as RespanInput);
-    // Respan all of the tokens in the `Path`
-    let to_respan: proc_macro2::TokenStream = to_respan
-        .into_token_stream()
-        .into_iter()
-        .map(|mut t| {
-            // Combine the location of the token with the resolution behavior of `respan_using`
-            let new_span: Span = t.span().resolved_at(respan_using);
-            t.set_span(new_span);
-            t
-        })
-        .collect();
-    TokenStream::from(to_respan)
-}
-
 #[proc_macro]
 pub fn pubkey(input: TokenStream) -> TokenStream {
     let id = parse_macro_input!(input as SdkPubkey);
@@ -376,34 +307,6 @@ impl ToTokens for Pubkeys {
 pub fn pubkeys(input: TokenStream) -> TokenStream {
     let pubkeys = parse_macro_input!(input as Pubkeys);
     TokenStream::from(quote! {#pubkeys})
-}
-
-// The normal `wasm_bindgen` macro generates a .bss section which causes the resulting
-// SBF program to fail to load, so for now this stub should be used when building for SBF
-#[proc_macro_attribute]
-pub fn wasm_bindgen_stub(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    match parse_macro_input!(item as syn::Item) {
-        syn::Item::Struct(mut item_struct) => {
-            if let syn::Fields::Named(fields) = &mut item_struct.fields {
-                // Strip out any `#[wasm_bindgen]` added to struct fields. This is custom
-                // syntax supplied by the normal `wasm_bindgen` macro.
-                for field in fields.named.iter_mut() {
-                    field.attrs.retain(|attr| {
-                        !attr
-                            .path()
-                            .segments
-                            .iter()
-                            .any(|segment| segment.ident == "wasm_bindgen")
-                    });
-                }
-            }
-            quote! { #item_struct }
-        }
-        item => {
-            quote!(#item)
-        }
-    }
-    .into()
 }
 
 // Sets padding in structures to zero explicitly.

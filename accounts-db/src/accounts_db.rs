@@ -56,7 +56,7 @@ use {
         },
         append_vec::{
             aligned_stored_size, APPEND_VEC_MMAPPED_FILES_DIRTY, APPEND_VEC_MMAPPED_FILES_OPEN,
-            STORE_META_OVERHEAD,
+            APPEND_VEC_REOPEN_AS_FILE_IO, STORE_META_OVERHEAD,
         },
         cache_hash_data::{
             CacheHashData, CacheHashDataFileReference, DeletionPolicy as CacheHashDeletionPolicy,
@@ -583,6 +583,7 @@ impl AccountFromStorage {
 pub struct GetUniqueAccountsResult {
     pub stored_accounts: Vec<AccountFromStorage>,
     pub capacity: u64,
+    pub num_duplicated_accounts: usize,
 }
 
 pub struct AccountsAddRootTiming {
@@ -1121,6 +1122,7 @@ impl AccountStorageEntry {
             return None;
         }
 
+        APPEND_VEC_REOPEN_AS_FILE_IO.fetch_add(1, Ordering::Relaxed);
         let count_and_status = self.count_and_status.lock_write();
         self.accounts.reopen_as_readonly().map(|accounts| Self {
             id: self.id,
@@ -1698,7 +1700,7 @@ impl SplitAncientStorages {
                     i += 1;
                     if treat_as_ancient(storage) {
                         // even though the slot is in range of being an ancient append vec, if it isn't actually a large append vec,
-                        // then we are better off treating all these slots as normally cachable to reduce work in dedup.
+                        // then we are better off treating all these slots as normally cacheable to reduce work in dedup.
                         // Since this one is large, for the moment, this one becomes the highest slot where we want to individually cache files.
                         len_truncate = i;
                     }
@@ -1917,6 +1919,11 @@ impl LatestAccountsIndexRootsStats {
                 "append_vecs_dirty",
                 APPEND_VEC_MMAPPED_FILES_DIRTY.load(Ordering::Relaxed),
                 i64
+            ),
+            (
+                "append_vecs_open_as_file_io",
+                APPEND_VEC_REOPEN_AS_FILE_IO.load(Ordering::Relaxed),
+                i64
             )
         );
 
@@ -1954,6 +1961,9 @@ pub(crate) struct ShrinkAncientStats {
     pub(crate) slots_considered: AtomicU64,
     pub(crate) ancient_scanned: AtomicU64,
     pub(crate) bytes_ancient_created: AtomicU64,
+    pub(crate) bytes_from_must_shrink: AtomicU64,
+    pub(crate) bytes_from_smallest_storages: AtomicU64,
+    pub(crate) bytes_from_newest_storages: AtomicU64,
     pub(crate) many_ref_slots_skipped: AtomicU64,
     pub(crate) slots_cannot_move_count: AtomicU64,
     pub(crate) many_refs_old_alive: AtomicU64,
@@ -1983,6 +1993,7 @@ pub struct ShrinkStats {
     last_report: AtomicInterval,
     pub(crate) num_slots_shrunk: AtomicUsize,
     storage_read_elapsed: AtomicU64,
+    num_duplicated_accounts: AtomicU64,
     index_read_elapsed: AtomicU64,
     create_and_insert_store_elapsed: AtomicU64,
     store_accounts_elapsed: AtomicU64,
@@ -2015,6 +2026,11 @@ impl ShrinkStats {
                 (
                     "storage_read_elapsed",
                     self.storage_read_elapsed.swap(0, Ordering::Relaxed) as i64,
+                    i64
+                ),
+                (
+                    "num_duplicated_accounts",
+                    self.num_duplicated_accounts.swap(0, Ordering::Relaxed),
                     i64
                 ),
                 (
@@ -2114,6 +2130,13 @@ impl ShrinkAncientStats {
                 self.shrink_stats
                     .storage_read_elapsed
                     .swap(0, Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "num_duplicated_accounts",
+                self.shrink_stats
+                    .num_duplicated_accounts
+                    .swap(0, Ordering::Relaxed),
                 i64
             ),
             (
@@ -2244,6 +2267,21 @@ impl ShrinkAncientStats {
             (
                 "bytes_ancient_created",
                 self.bytes_ancient_created.swap(0, Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "bytes_from_must_shrink",
+                self.bytes_from_must_shrink.swap(0, Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "bytes_from_smallest_storages",
+                self.bytes_from_smallest_storages.swap(0, Ordering::Relaxed) as i64,
+                i64
+            ),
+            (
+                "bytes_from_newest_storages",
+                self.bytes_from_newest_storages.swap(0, Ordering::Relaxed) as i64,
                 i64
             ),
             (
@@ -3882,19 +3920,21 @@ impl AccountsDb {
         });
 
         // sort by pubkey to keep account index lookups close
-        Self::sort_and_remove_dups(&mut stored_accounts);
+        let num_duplicated_accounts = Self::sort_and_remove_dups(&mut stored_accounts);
 
         GetUniqueAccountsResult {
             stored_accounts,
             capacity,
+            num_duplicated_accounts,
         }
     }
 
     /// sort `accounts` by pubkey.
     /// Remove earlier entries with the same pubkey as later entries.
-    fn sort_and_remove_dups(accounts: &mut Vec<AccountFromStorage>) {
+    fn sort_and_remove_dups(accounts: &mut Vec<AccountFromStorage>) -> usize {
         // stable sort because we want the most recent only
         accounts.sort_by(|a, b| a.pubkey().cmp(b.pubkey()));
+        let len0 = accounts.len();
         if accounts.len() > 1 {
             let mut i = 0;
             // iterate 0..1 less than end
@@ -3910,6 +3950,7 @@ impl AccountsDb {
                 i += 1;
             }
         }
+        len0 - accounts.len()
     }
 
     pub(crate) fn get_unique_accounts_from_storage_for_shrink(
@@ -3922,6 +3963,9 @@ impl AccountsDb {
         stats
             .storage_read_elapsed
             .fetch_add(storage_read_elapsed_us, Ordering::Relaxed);
+        stats
+            .num_duplicated_accounts
+            .fetch_add(result.num_duplicated_accounts as u64, Ordering::Relaxed);
         result
     }
 
@@ -3938,6 +3982,7 @@ impl AccountsDb {
         let GetUniqueAccountsResult {
             stored_accounts,
             capacity,
+            num_duplicated_accounts,
         } = unique_accounts;
 
         let mut index_read_elapsed = Measure::start("index_read_elapsed");
@@ -3948,6 +3993,9 @@ impl AccountsDb {
         stats
             .accounts_loaded
             .fetch_add(len as u64, Ordering::Relaxed);
+        stats
+            .num_duplicated_accounts
+            .fetch_add(*num_duplicated_accounts as u64, Ordering::Relaxed);
         let all_are_zero_lamports_collect = Mutex::new(true);
         let index_entries_being_shrunk_outer = Mutex::new(Vec::default());
         self.thread_pool_clean.install(|| {
@@ -5786,7 +5834,7 @@ impl AccountsDb {
 
     /// This should only be called after the `Bank::drop()` runs in bank.rs, See BANK_DROP_SAFETY
     /// comment below for more explanation.
-    ///   * `is_serialized_with_abs` - indicates whehter this call runs sequentially with all other
+    ///   * `is_serialized_with_abs` - indicates whether this call runs sequentially with all other
     ///        accounts_db relevant calls, such as shrinking, purging etc., in account background
     ///        service.
     pub fn purge_slot(&self, slot: Slot, bank_id: BankId, is_serialized_with_abs: bool) {
@@ -6170,7 +6218,7 @@ impl AccountsDb {
         // allocate a buffer on the stack that's big enough
         // to hold a token account or a stake account
         const META_SIZE: usize = 8 /* lamports */ + 8 /* rent_epoch */ + 1 /* executable */ + 32 /* owner */ + 32 /* pubkey */;
-        const DATA_SIZE: usize = 200; // stake acounts are 200 B and token accounts are 165-182ish B
+        const DATA_SIZE: usize = 200; // stake accounts are 200 B and token accounts are 165-182ish B
         const BUFFER_SIZE: usize = META_SIZE + DATA_SIZE;
         let mut buffer = SmallVec::<[u8; BUFFER_SIZE]>::new();
 
@@ -8938,7 +8986,7 @@ impl AccountsDb {
                 // these write directly to disk, so the more threads, the better
                 num_cpus::get()
             } else {
-                // seems to be a good hueristic given varying # cpus for in-mem disk index
+                // seems to be a good heuristic given varying # cpus for in-mem disk index
                 8
             };
             let chunk_size = (outer_slots_len / (std::cmp::max(1, threads.saturating_sub(1)))) + 1; // approximately 400k slots in a snapshot
@@ -17121,6 +17169,7 @@ pub mod tests {
         let GetUniqueAccountsResult {
             stored_accounts: after_stored_accounts,
             capacity: after_capacity,
+            ..
         } = db.get_unique_accounts_from_storage(&after_store);
         assert!(created_accounts.capacity <= after_capacity);
         assert_eq!(created_accounts.stored_accounts.len(), 1);
@@ -17135,6 +17184,7 @@ pub mod tests {
         let GetUniqueAccountsResult {
             stored_accounts: after_stored_accounts,
             capacity: after_capacity,
+            ..
         } = db.get_unique_accounts_from_storage(&after_store);
         assert!(created_accounts.capacity <= after_capacity);
         assert_eq!(created_accounts.stored_accounts.len(), 1);
@@ -17611,6 +17661,7 @@ pub mod tests {
         let GetUniqueAccountsResult {
             stored_accounts: after_stored_accounts,
             capacity: after_capacity,
+            ..
         } = db.get_unique_accounts_from_storage(&after_store);
         if alive {
             assert!(created_accounts.capacity <= after_capacity);
